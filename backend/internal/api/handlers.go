@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"torrent-backend/internal/models"
 	"torrent-backend/internal/torrent"
+
 	"github.com/go-chi/chi/v5"
 )
 
@@ -12,25 +13,21 @@ type Handler struct {
 	TorrentManager *torrent.TorrentManager
 }
 
-
 func NewHandler(tm *torrent.TorrentManager) *Handler {
 	return &Handler{
 		TorrentManager: tm,
 	}
 }
 
-
 func (h *Handler) GetAllTorrents(w http.ResponseWriter, r *http.Request) {
 
-	
 	torrents := h.TorrentManager.GetAllTorrents()
-
 
 	w.Header().Set("Content-Type", "application/json")
 
-	
 	json.NewEncoder(w).Encode(torrents)
 }
+
 // this is getting all the Req from the user
 
 // Handles POST /torrent/add
@@ -51,7 +48,7 @@ func (h *Handler) AddTorrent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Torrent ID is required", http.StatusBadRequest)
 		return
 	}
-	// duplicate torrent 
+	// duplicate torrent
 	_, exists := h.TorrentManager.GetTorrent(newTorrent.ID)
 
 	if exists {
