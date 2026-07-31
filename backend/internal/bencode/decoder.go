@@ -3,7 +3,6 @@ package bencode
 import (
 	"errors"
 )
-
 type Decoder struct {
 	data []byte
 	pos  int
