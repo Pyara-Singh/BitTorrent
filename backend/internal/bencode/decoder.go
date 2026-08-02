@@ -135,7 +135,7 @@ func (d *Decoder) DecodeDictionary() (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-
+		
 		dict[key] = value
 	}
 
@@ -160,5 +160,6 @@ func (d *Decoder) Decode() (any, error) {
 
 	default:
 		return d.DecodeString()
+		
 	}
 }

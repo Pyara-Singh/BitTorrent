@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"github.com/go-chi/chi/v5"
-	"torrent-backend/internal/api"z
+	"torrent-backend/internal/api"
 	"torrent-backend/internal/torrent"
 )
 

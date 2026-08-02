@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"torrent-backend/internal/models"
 	"torrent-backend/internal/torrent"
-
 	"github.com/go-chi/chi/v5"
 )
 
