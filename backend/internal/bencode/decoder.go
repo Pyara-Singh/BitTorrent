@@ -3,9 +3,13 @@ package bencode
 import (
 	"errors"
 )
+
 type Decoder struct {
 	data []byte
 	pos  int
+
+	infoStart int
+	infoEnd   int
 }
 
 func NewDecoder(data []byte) *Decoder {
@@ -14,7 +18,9 @@ func NewDecoder(data []byte) *Decoder {
 		pos:  0,
 	}
 }
-
+func (d *Decoder) Position() int {
+	return d.pos
+}
 func (d *Decoder) DecodeInteger() (int, error) {
 
 	// Integer must start with 'i'
@@ -135,7 +141,7 @@ func (d *Decoder) DecodeDictionary() (map[string]any, error) {
 		if err != nil {
 			return nil, err
 		}
-		
+
 		dict[key] = value
 	}
 
@@ -160,6 +166,6 @@ func (d *Decoder) Decode() (any, error) {
 
 	default:
 		return d.DecodeString()
-		
+
 	}
 }
