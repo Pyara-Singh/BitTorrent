@@ -6,4 +6,6 @@ type TorrentMeta struct {
 	Length      int64
 	PieceLength int
 	Pieces      []byte
+	InfoHash    [20]byte
 }
+
