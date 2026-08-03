@@ -4,10 +4,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
+
 	"torrent-backend/internal/bencode"
 	"torrent-backend/internal/models"
 )
@@ -36,7 +39,11 @@ func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer,
 	trackerURL := fmt.Sprintf("%s?info_hash=%s&%s", base.String(), encodedHash, params.Encode())
 
 	// 3. Send the HTTP GET request
-	resp, err := http.Get(trackerURL)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := client.Get(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("tracker request failed: %w", err)
 	}
@@ -48,19 +55,13 @@ func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer,
 
 	// 4. Decode the Bencoded response
 	// Read full response body
-	var body []byte
-	buf := make([]byte, 4096)
-	for {
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			body = append(body, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tracker response: %w", err)
 	}
 
 	decoder := bencode.NewDecoder(body)
+
 	decodedData, err := decoder.Decode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode tracker response: %w", err)
@@ -88,16 +89,19 @@ func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer,
 
 // urlEncodeHash converts a 20-byte InfoHash into a raw URL-escaped string (e.g. %da%fc...)
 func urlEncodeHash(hash [20]byte) string {
-	var result string
+	result := ""
+
 	for _, b := range hash {
 		result += fmt.Sprintf("%%%02x", b)
 	}
+
 	return result
 }
 
 // parseCompactPeers splits the compact peers binary data into individual Peer structs
 func parseCompactPeers(peersBin []byte) ([]models.Peer, error) {
 	const peerSize = 6 // 4 bytes IP + 2 bytes Port
+
 	if len(peersBin)%peerSize != 0 {
 		return nil, errors.New("invalid compact peers binary data length")
 	}
