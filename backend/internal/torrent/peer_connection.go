@@ -20,7 +20,7 @@ type PeerConn struct {
 	PeerID     [20]byte
 }
 
-// Connect establishes a TCP connection, performs the 68-byte BitTorrent handshake,
+// Connect establishes a TCP connection, performs the 68-byte BitTorrent handshake
 // and returns an active PeerConn if the handshake is successful and validated.
 func Connect(peer models.Peer, infoHash [20]byte, peerID [20]byte) (*PeerConn, error) {
 	// 1. Build host:port address
@@ -68,8 +68,8 @@ func Connect(peer models.Peer, infoHash [20]byte, peerID [20]byte) (*PeerConn, e
 	// 7. Handshake successful, return active PeerConn
 	return &PeerConn{
 		Conn:       conn,
-		Choked:     true,       // BitTorrent spec states peer starts choked
-		Interested: false,      // We start not interested
+		Choked:     true,  // BitTorrent spec states peer starts choked
+		Interested: false, // We start not interested
 		Peer:       peer,
 		InfoHash:   infoHash,
 		PeerID:     reply.PeerID, // Store the peer's actual client ID
