@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// Handshake represents the 68-byte message exchanged when establishing a peer connection.
+// Handshake represents the 68-byte message exchanged when establishing a peer connection. ok
 type Handshake struct {
 	Pstr     string
 	InfoHash [20]byte
