@@ -9,40 +9,21 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"torrent-backend/internal/bencode"
 	"torrent-backend/internal/models"
 )
 
-// GetPeers contacts the tracker and returns a list of discovered peers.
+// GetPeers contacts the HTTP tracker and returns compact IPv4 peers.
 func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer, error) {
-	// 1. Manually URL-encode the 20-byte binary InfoHash
-	encodedHash := urlEncodeHash(meta.InfoHash)
-
-	// 2. Build the query parameters
-	base, err := url.Parse(meta.Announce)
+	trackerURL, err := buildAnnounceURL(meta, peerID, port)
 	if err != nil {
-		return nil, fmt.Errorf("invalid announce URL: %w", err)
+		return nil, err
 	}
 
-	params := url.Values{}
-	params.Set("peer_id", peerID)
-	params.Set("port", strconv.Itoa(port))
-	params.Set("uploaded", "0")
-	params.Set("downloaded", "0")
-	params.Set("left", strconv.FormatInt(meta.Length, 10))
-	params.Set("compact", "1")
-	params.Set("event", "started")
-
-	// Append the query parameters to announce URL, appending our raw info_hash
-	trackerURL := fmt.Sprintf("%s?info_hash=%s&%s", base.String(), encodedHash, params.Encode())
-
-	// 3. Send the HTTP GET request
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
+	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("tracker request failed: %w", err)
@@ -53,16 +34,12 @@ func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer,
 		return nil, fmt.Errorf("tracker returned status %d", resp.StatusCode)
 	}
 
-	// 4. Decode the Bencoded response
-	// Read full response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read tracker response: %w", err)
 	}
 
-	decoder := bencode.NewDecoder(body)
-
-	decodedData, err := decoder.Decode()
+	decodedData, err := bencode.NewDecoder(body).Decode()
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode tracker response: %w", err)
 	}
@@ -72,52 +49,73 @@ func GetPeers(meta *models.TorrentMeta, peerID string, port int) ([]models.Peer,
 		return nil, errors.New("tracker response must be a dictionary")
 	}
 
-	// Check if the tracker returned a failure reason
 	if failure, ok := respDict["failure reason"].(string); ok {
 		return nil, fmt.Errorf("tracker failed: %s", failure)
 	}
 
-	// Extract compact peers string
 	peersStr, ok := respDict["peers"].(string)
 	if !ok {
-		return nil, errors.New("missing or invalid peers in tracker response")
+		return nil, errors.New("missing or invalid compact peers")
 	}
 
-	// 5. Parse the compact peer list
-	return parseCompactPeers([]byte(peersStr))
+	peers, err := parseCompactPeers([]byte(peersStr))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse compact peers: %w", err)
+	}
+	return peers, nil
 }
 
-// urlEncodeHash converts a 20-byte InfoHash into a raw URL-escaped string (e.g. %da%fc...)
+func buildAnnounceURL(meta *models.TorrentMeta, peerID string, port int) (string, error) {
+	if meta == nil {
+		return "", errors.New("torrent metadata is nil")
+	}
+	base, err := url.Parse(meta.Announce)
+	if err != nil {
+		return "", fmt.Errorf("invalid announce URL: %w", err)
+	}
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return "", fmt.Errorf("unsupported tracker scheme %q", base.Scheme)
+	}
+
+	query := base.Query()
+	query.Set("peer_id", peerID)
+	query.Set("port", strconv.Itoa(port))
+	query.Set("uploaded", "0")
+	query.Set("downloaded", "0")
+	query.Set("left", strconv.FormatInt(meta.Length, 10))
+	query.Set("compact", "1")
+	query.Set("event", "started")
+
+	encoded := query.Encode()
+	if encoded == "" {
+		base.RawQuery = "info_hash=" + urlEncodeHash(meta.InfoHash)
+	} else {
+		base.RawQuery = "info_hash=" + urlEncodeHash(meta.InfoHash) + "&" + encoded
+	}
+	return base.String(), nil
+}
+
 func urlEncodeHash(hash [20]byte) string {
-	result := ""
-
+	var builder strings.Builder
+	builder.Grow(60)
 	for _, b := range hash {
-		result += fmt.Sprintf("%%%02x", b)
+		fmt.Fprintf(&builder, "%%%02X", b)
 	}
-
-	return result
+	return builder.String()
 }
 
-// parseCompactPeers splits the compact peers binary data into individual Peer structs
 func parseCompactPeers(peersBin []byte) ([]models.Peer, error) {
-	const peerSize = 6 // 4 bytes IP + 2 bytes Port
-
+	const peerSize = 6
 	if len(peersBin)%peerSize != 0 {
-		return nil, errors.New("invalid compact peers binary data length")
+		return nil, errors.New("compact peer list length must be divisible by 6")
 	}
 
-	numPeers := len(peersBin) / peerSize
-	peers := make([]models.Peer, 0, numPeers)
-
+	peers := make([]models.Peer, 0, len(peersBin)/peerSize)
 	for i := 0; i < len(peersBin); i += peerSize {
-		ip := net.IP(peersBin[i : i+4]).String()
-		port := binary.BigEndian.Uint16(peersBin[i+4 : i+6])
-
 		peers = append(peers, models.Peer{
-			IP:   ip,
-			Port: port,
+			IP:   net.IP(peersBin[i : i+4]).String(),
+			Port: binary.BigEndian.Uint16(peersBin[i+4 : i+6]),
 		})
 	}
-
 	return peers, nil
 }

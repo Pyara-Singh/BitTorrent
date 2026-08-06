@@ -5,18 +5,25 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
+	"sort"
 )
 
-// PieceWork manages the memory buffer and download progress of a single piece.
+type byteRange struct {
+	begin int
+	end   int
+}
+
+// PieceWork owns the in-memory state for one piece download.
 type PieceWork struct {
 	Index      int
 	Length     int
 	Hash       [20]byte
 	Buffer     []byte
 	Downloaded int
+
+	received []byteRange
 }
 
-// NewPieceWork initializes a memory buffer for a piece of the specified length.
 func NewPieceWork(index int, length int, hash [20]byte) *PieceWork {
 	return &PieceWork{
 		Index:  index,
@@ -26,36 +33,64 @@ func NewPieceWork(index int, length int, hash [20]byte) *PieceWork {
 	}
 }
 
-// WriteBlock copies a downloaded block of data into the correct offset within the piece buffer.
 func (pw *PieceWork) WriteBlock(begin int, block []byte) error {
+	if pw == nil {
+		return errors.New("piece work is nil")
+	}
 	if begin < 0 {
 		return errors.New("invalid block offset")
 	}
-
 	if len(block) == 0 {
 		return errors.New("empty block")
 	}
-
 	if begin+len(block) > pw.Length {
-		return fmt.Errorf(
-			"block offset %d with length %d exceeds piece length %d",
-			begin,
-			len(block),
-			pw.Length,
-		)
+		return fmt.Errorf("block offset %d with length %d exceeds piece length %d", begin, len(block), pw.Length)
 	}
 
-	copy(pw.Buffer[begin:], block)
-	pw.Downloaded += len(block)
-
+	copy(pw.Buffer[begin:begin+len(block)], block)
+	pw.addReceivedRange(begin, begin+len(block))
 	return nil
 }
 
-// Verify calculates the SHA-1 hash of the assembled piece and compares it to the expected hash.
+func (pw *PieceWork) Complete() bool {
+	return pw.Downloaded == pw.Length
+}
+
 func (pw *PieceWork) Verify() error {
+	if pw == nil {
+		return errors.New("piece work is nil")
+	}
+	if !pw.Complete() {
+		return fmt.Errorf("piece incomplete: downloaded %d of %d bytes", pw.Downloaded, pw.Length)
+	}
+
 	sum := sha1.Sum(pw.Buffer)
 	if !bytes.Equal(sum[:], pw.Hash[:]) {
-		return errors.New("piece hash verification failed (data corruption)")
+		return errors.New("piece hash verification failed")
 	}
 	return nil
+}
+
+func (pw *PieceWork) addReceivedRange(begin, end int) {
+	pw.received = append(pw.received, byteRange{begin: begin, end: end})
+	sort.Slice(pw.received, func(i, j int) bool {
+		return pw.received[i].begin < pw.received[j].begin
+	})
+
+	merged := pw.received[:0]
+	for _, current := range pw.received {
+		if len(merged) == 0 || current.begin > merged[len(merged)-1].end {
+			merged = append(merged, current)
+			continue
+		}
+		if current.end > merged[len(merged)-1].end {
+			merged[len(merged)-1].end = current.end
+		}
+	}
+
+	pw.received = merged
+	pw.Downloaded = 0
+	for _, received := range pw.received {
+		pw.Downloaded += received.end - received.begin
+	}
 }

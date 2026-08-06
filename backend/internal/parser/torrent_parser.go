@@ -3,42 +3,41 @@ package parser
 import (
 	"crypto/sha1"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"torrent-backend/internal/bencode"
 	"torrent-backend/internal/models"
 )
 
 func ParseTorrentFile(path string) (*models.TorrentMeta, error) {
-
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read torrent file: %w", err)
 	}
 
-	// First pass: extract the raw bencoded 'info' dictionary bytes
+	return ParseTorrent(data)
+}
+
+func ParseTorrent(data []byte) (*models.TorrentMeta, error) {
 	rawInfo, err := ExtractInfoBytes(data)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to extract info dictionary: %w", err)
 	}
 
-	// Compute the 20-byte SHA-1 hash of the raw info dictionary
 	infoHash := sha1.Sum(rawInfo)
-
-	// Second pass: decode the entire file structure normally
-	decoder := bencode.NewDecoder(data)
-
-	decodedData, err := decoder.Decode()
+	decodedData, err := bencode.NewDecoder(data).Decode()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to decode torrent file: %w", err)
 	}
-	torrentDict, ok := decodedData.(map[string]any)
 
+	torrentDict, ok := decodedData.(map[string]any)
 	if !ok {
-		return nil, errors.New("invalid torrent file")
+		return nil, errors.New("torrent root must be a dictionary")
 	}
-	// Announce URL is a required field in torrent files
+
 	announce, ok := torrentDict["announce"].(string)
-	if !ok {
+	if !ok || announce == "" {
 		return nil, errors.New("missing announce URL")
 	}
 
@@ -47,152 +46,284 @@ func ParseTorrentFile(path string) (*models.TorrentMeta, error) {
 		return nil, errors.New("missing info dictionary")
 	}
 
-	name, ok := infoDict["name"].(string)
-	if !ok {
-		return nil, errors.New("missing torrent name")
-	}
-	pieceLength, ok := infoDict["piece length"].(int)
-	if !ok {
-		return nil, errors.New("missing piece length")
-	}
-	length, ok := infoDict["length"].(int)
-	if !ok {
-		return nil, errors.New("missing file length")
+	name, err := requiredString(infoDict, "name")
+	if err != nil {
+		return nil, err
 	}
 
-	piecesString, ok := infoDict["pieces"].(string)
-	if !ok {
-		return nil, errors.New("missing pieces")
+	pieceLength, err := requiredPositiveInt(infoDict, "piece length")
+	if err != nil {
+		return nil, err
 	}
 
+	piecesString, err := requiredString(infoDict, "pieces")
+	if err != nil {
+		return nil, err
+	}
 	pieces := []byte(piecesString)
-	meta := &models.TorrentMeta{
-		Announce:    announce,
-		Name:        name,
-		Length:      int64(length),
-		PieceLength: pieceLength,
-		Pieces:      pieces,
-		InfoHash:    infoHash,
+	if len(pieces) == 0 || len(pieces)%sha1.Size != 0 {
+		return nil, fmt.Errorf("pieces field length %d is not a positive multiple of %d", len(pieces), sha1.Size)
 	}
 
-	return meta, nil
+	files, totalLength, err := parseFiles(infoDict, name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &models.TorrentMeta{
+		Announce:     announce,
+		AnnounceList: parseAnnounceList(torrentDict),
+		Name:         name,
+		Length:       totalLength,
+		PieceLength:  pieceLength,
+		Pieces:       pieces,
+		Files:        files,
+		InfoHash:     infoHash,
+	}, nil
 }
 
-// ExtractInfoBytes parses the top-level keys of a Bencoded torrent file dictionary,
-// locates the "info" key, and returns the slice of raw bytes corresponding to its value.
-func ExtractInfoBytes(data []byte) ([]byte, error) {
-	if len(data) == 0 || data[0] != 'd' {
-		return nil, errors.New("invalid bencode dictionary")
+func requiredString(dict map[string]any, key string) (string, error) {
+	value, ok := dict[key].(string)
+	if !ok || value == "" {
+		return "", fmt.Errorf("missing %s", key)
+	}
+	return value, nil
+}
+
+func requiredPositiveInt(dict map[string]any, key string) (int, error) {
+	value, ok := dict[key].(int)
+	if !ok || value <= 0 {
+		return 0, fmt.Errorf("missing or invalid %s", key)
+	}
+	return value, nil
+}
+
+func parseFiles(infoDict map[string]any, name string) ([]models.FileInfo, int64, error) {
+	if length, ok := infoDict["length"].(int); ok {
+		if length <= 0 {
+			return nil, 0, errors.New("file length must be positive")
+		}
+		file := models.FileInfo{Path: []string{name}, Length: int64(length)}
+		return []models.FileInfo{file}, int64(length), nil
 	}
 
-	pos := 1 // Skip initial 'd' of top-level dictionary
-	for pos < len(data) && data[pos] != 'e' {
-		// Read Bencoded string key
-		length := 0
-		for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
-			length = length*10 + int(data[pos]-'0')
-			pos++
-		}
-		if pos >= len(data) || data[pos] != ':' {
-			return nil, errors.New("invalid key string length")
-		}
-		pos++ // Skip ':'
+	rawFiles, ok := infoDict["files"].([]any)
+	if !ok || len(rawFiles) == 0 {
+		return nil, 0, errors.New("missing file length or files list")
+	}
 
-		// We extract the key string
-		key := string(data[pos : pos+length])
-		pos += length
+	files := make([]models.FileInfo, 0, len(rawFiles))
+	var total int64
+	for i, rawFile := range rawFiles {
+		fileDict, ok := rawFile.(map[string]any)
+		if !ok {
+			return nil, 0, fmt.Errorf("file entry %d must be a dictionary", i)
+		}
 
-		// The value starts right after the key string
-		valueStart := pos
-		var err error
-		pos, err = skip(data, pos)
+		length, ok := fileDict["length"].(int)
+		if !ok || length < 0 {
+			return nil, 0, fmt.Errorf("file entry %d has invalid length", i)
+		}
+
+		path, err := parseFilePath(fileDict, i)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
-		valueEnd := pos
 
-		// If this is the "info" key, return the raw Bencoded slice of its value
+		if int64(length) > math.MaxInt64-total {
+			return nil, 0, errors.New("torrent total length overflows int64")
+		}
+		total += int64(length)
+		files = append(files, models.FileInfo{Path: path, Length: int64(length)})
+	}
+
+	if total <= 0 {
+		return nil, 0, errors.New("torrent payload length must be positive")
+	}
+	return files, total, nil
+}
+
+func parseFilePath(fileDict map[string]any, index int) ([]string, error) {
+	rawPath, ok := fileDict["path"].([]any)
+	if !ok || len(rawPath) == 0 {
+		return nil, fmt.Errorf("file entry %d has missing path", index)
+	}
+
+	path := make([]string, 0, len(rawPath))
+	for j, rawPart := range rawPath {
+		part, ok := rawPart.(string)
+		if !ok || part == "" {
+			return nil, fmt.Errorf("file entry %d has invalid path element %d", index, j)
+		}
+		path = append(path, part)
+	}
+	return path, nil
+}
+
+func parseAnnounceList(torrentDict map[string]any) [][]string {
+	rawList, ok := torrentDict["announce-list"].([]any)
+	if !ok {
+		return nil
+	}
+
+	announceList := make([][]string, 0, len(rawList))
+	for _, rawTier := range rawList {
+		rawTrackers, ok := rawTier.([]any)
+		if !ok {
+			continue
+		}
+
+		tier := make([]string, 0, len(rawTrackers))
+		for _, rawTracker := range rawTrackers {
+			tracker, ok := rawTracker.(string)
+			if ok && tracker != "" {
+				tier = append(tier, tracker)
+			}
+		}
+		if len(tier) > 0 {
+			announceList = append(announceList, tier)
+		}
+	}
+	return announceList
+}
+
+// ExtractInfoBytes returns the exact raw bencoded value of the top-level info key.
+func ExtractInfoBytes(data []byte) ([]byte, error) {
+	if len(data) == 0 || data[0] != 'd' {
+		return nil, errors.New("torrent root must be a bencoded dictionary")
+	}
+
+	pos := 1
+	for {
+		if pos >= len(data) {
+			return nil, errors.New("unterminated top-level dictionary")
+		}
+		if data[pos] == 'e' {
+			return nil, errors.New("info dictionary not found")
+		}
+
+		key, next, err := scanString(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("invalid top-level key: %w", err)
+		}
+		pos = next
+
+		valueStart := pos
+		valueEnd, err := skip(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value for top-level key %q: %w", key, err)
+		}
 		if key == "info" {
 			return data[valueStart:valueEnd], nil
 		}
+		pos = valueEnd
 	}
-
-	return nil, errors.New("info dictionary not found in torrent file")
 }
 
-// skip scans one complete Bencoded value starting at pos, returning the new position after the value.
-// It is allocation-free and optimized for scanning raw byte boundaries.
+func scanString(data []byte, pos int) (string, int, error) {
+	if pos >= len(data) || data[pos] < '0' || data[pos] > '9' {
+		return "", pos, errors.New("expected string")
+	}
+
+	length := 0
+	start := pos
+	for pos < len(data) && data[pos] != ':' {
+		if data[pos] < '0' || data[pos] > '9' {
+			return "", pos, errors.New("invalid string length")
+		}
+		if length > (math.MaxInt-int(data[pos]-'0'))/10 {
+			return "", pos, errors.New("string length overflows int")
+		}
+		length = length*10 + int(data[pos]-'0')
+		pos++
+	}
+	if pos >= len(data) {
+		return "", pos, errors.New("unterminated string length")
+	}
+	if data[start] == '0' && pos-start > 1 {
+		return "", pos, errors.New("string length has leading zero")
+	}
+
+	pos++
+	if pos+length > len(data) {
+		return "", pos, errors.New("string length exceeds input")
+	}
+	return string(data[pos : pos+length]), pos + length, nil
+}
+
 func skip(data []byte, pos int) (int, error) {
 	if pos >= len(data) {
-		return pos, errors.New("unexpected end of input during skip")
+		return pos, errors.New("unexpected end of input")
 	}
 
 	switch data[pos] {
 	case 'i':
-		// Integer: 'i' <digits> 'e'
-		pos++ // Skip 'i'
-		for pos < len(data) && data[pos] != 'e' {
-			pos++
-		}
-		if pos >= len(data) {
-			return pos, errors.New("unterminated bencoded integer")
-		}
-		pos++ // Skip 'e'
-		return pos, nil
-
+		return skipInteger(data, pos)
 	case 'l':
-		// List: 'l' <elements> 'e'
-		pos++ // Skip 'l'
-		for pos < len(data) && data[pos] != 'e' {
-			var err error
-			pos, err = skip(data, pos)
-			if err != nil {
-				return pos, err
-			}
-		}
-		if pos >= len(data) {
-			return pos, errors.New("unterminated bencoded list")
-		}
-		pos++ // Skip 'e'
-		return pos, nil
-
+		return skipList(data, pos)
 	case 'd':
-		// Dictionary: 'd' <key-value pairs> 'e'
-		pos++ // Skip 'd'
-		for pos < len(data) && data[pos] != 'e' {
-			var err error
-			// Skip key (must be a Bencoded string)
-			pos, err = skip(data, pos)
-			if err != nil {
-				return pos, err
-			}
-			// Skip value (any Bencoded type)
-			pos, err = skip(data, pos)
-			if err != nil {
-				return pos, err
-			}
-		}
-		if pos >= len(data) {
-			return pos, errors.New("unterminated bencoded dictionary")
-		}
-		pos++ // Skip 'e'
-		return pos, nil
-
+		return skipDictionary(data, pos)
 	default:
-		// String: <length> ':' <bytes>
-		length := 0
-		for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
-			length = length*10 + int(data[pos]-'0')
-			pos++
+		_, next, err := scanString(data, pos)
+		return next, err
+	}
+}
+
+func skipInteger(data []byte, pos int) (int, error) {
+	pos++
+	start := pos
+	for pos < len(data) && data[pos] != 'e' {
+		if data[pos] != '-' && (data[pos] < '0' || data[pos] > '9') {
+			return pos, errors.New("invalid integer digit")
 		}
-		if pos >= len(data) || data[pos] != ':' {
-			return pos, errors.New("invalid string bencode format")
+		pos++
+	}
+	if pos >= len(data) {
+		return pos, errors.New("unterminated integer")
+	}
+	if start == pos {
+		return pos, errors.New("empty integer")
+	}
+	return pos + 1, nil
+}
+
+func skipList(data []byte, pos int) (int, error) {
+	pos++
+	for {
+		if pos >= len(data) {
+			return pos, errors.New("unterminated list")
 		}
-		pos++ // Skip ':'
-		pos += length
-		if pos > len(data) {
-			return pos, errors.New("string length out of bounds")
+		if data[pos] == 'e' {
+			return pos + 1, nil
 		}
-		return pos, nil
+		next, err := skip(data, pos)
+		if err != nil {
+			return pos, err
+		}
+		pos = next
+	}
+}
+
+func skipDictionary(data []byte, pos int) (int, error) {
+	pos++
+	for {
+		if pos >= len(data) {
+			return pos, errors.New("unterminated dictionary")
+		}
+		if data[pos] == 'e' {
+			return pos + 1, nil
+		}
+
+		next, err := skip(data, pos)
+		if err != nil {
+			return pos, err
+		}
+		pos = next
+
+		next, err = skip(data, pos)
+		if err != nil {
+			return pos, err
+		}
+		pos = next
 	}
 }

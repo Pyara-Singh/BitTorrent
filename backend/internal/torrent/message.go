@@ -2,11 +2,11 @@ package torrent
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 )
 
-// Message ID constants representing the standard BitTorrent peer wire protocol messages.
 const (
 	MsgChoke         byte = 0
 	MsgUnchoke       byte = 1
@@ -19,80 +19,60 @@ const (
 	MsgCancel        byte = 8
 )
 
-// MaxPayloadSize sets a safe upper limit on incoming message sizes to prevent
-// memory exhaustion attacks from malicious peers sending fake large length prefixes.
-// 16MB is a generous upper bound (standard piece blocks are usually 16KB).
 const MaxPayloadSize = 16 * 1024 * 1024
 
-// Message represents a parsed peer wire protocol message.
 type Message struct {
 	ID      byte
 	Payload []byte
 }
 
-// Serialize encodes a Message into a standard binary format to be sent over the wire.
-// Format: <length prefix (4 bytes)><message ID (1 byte)><payload>
+type BlockRequest struct {
+	Index  int
+	Begin  int
+	Length int
+}
+
+type PieceBlock struct {
+	Index int
+	Begin int
+	Block []byte
+}
+
 func (m *Message) Serialize() []byte {
 	if m == nil {
-		// A nil message represents a Keep-Alive message (length prefix 0)
 		return make([]byte, 4)
 	}
 
-	// Total length = 1 byte (ID) + length of payload
 	length := uint32(1 + len(m.Payload))
-
-	// Create a buffer large enough to hold length prefix, ID, and payload
 	buf := make([]byte, 4+length)
-
-	// Write length prefix (4 bytes, Big-Endian)
 	binary.BigEndian.PutUint32(buf[0:4], length)
-
-	// Write Message ID (1 byte)
 	buf[4] = m.ID
-
-	// Write Payload
 	copy(buf[5:], m.Payload)
-
 	return buf
 }
 
-// ReadMessage safely reads a Message from a TCP connection stream.
 func ReadMessage(r io.Reader) (*Message, error) {
 	lengthBuf := make([]byte, 4)
-
-	// Read the 4-byte length prefix
-	_, err := io.ReadFull(r, lengthBuf)
-	if err != nil {
+	if _, err := io.ReadFull(r, lengthBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message length: %w", err)
 	}
 
 	length := binary.BigEndian.Uint32(lengthBuf)
-
-	// Keep-Alive message (length 0)
 	if length == 0 {
 		return nil, nil
 	}
-
-	// Security check to prevent memory exhaustion
 	if length > MaxPayloadSize {
-		return nil, fmt.Errorf("message length %d exceeds safe maximum %d", length, MaxPayloadSize)
+		return nil, fmt.Errorf("message length %d exceeds maximum %d", length, MaxPayloadSize)
 	}
 
-	// Allocate a buffer for the rest of the message (ID + Payload)
 	messageBuf := make([]byte, length)
-	_, err = io.ReadFull(r, messageBuf)
-	if err != nil {
+	if _, err := io.ReadFull(r, messageBuf); err != nil {
 		return nil, fmt.Errorf("failed to read message body: %w", err)
 	}
 
-	// Parse ID and Payload
-	return &Message{
-		ID:      messageBuf[0],
-		Payload: messageBuf[1:],
-	}, nil
+	return &Message{ID: messageBuf[0], Payload: messageBuf[1:]}, nil
 }
 
-// FormatRequest creates a Request message to ask the peer for a block of data.
 func FormatRequest(index, begin, length int) *Message {
 	payload := make([]byte, 12)
 	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
@@ -101,18 +81,111 @@ func FormatRequest(index, begin, length int) *Message {
 	return &Message{ID: MsgRequest, Payload: payload}
 }
 
-// FormatHave creates a Have message to tell the peer we finished downloading a piece.
+func FormatCancel(index, begin, length int) *Message {
+	msg := FormatRequest(index, begin, length)
+	msg.ID = MsgCancel
+	return msg
+}
+
 func FormatHave(index int) *Message {
 	payload := make([]byte, 4)
 	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
 	return &Message{ID: MsgHave, Payload: payload}
 }
 
-// FormatPiece creates a Piece message to deliver a block of data to the peer.
 func FormatPiece(index, begin int, block []byte) *Message {
 	payload := make([]byte, 8+len(block))
 	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
 	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
 	copy(payload[8:], block)
 	return &Message{ID: MsgPiece, Payload: payload}
+}
+
+func ParseHave(msg *Message) (int, error) {
+	if msg == nil || msg.ID != MsgHave {
+		return 0, errors.New("expected have message")
+	}
+	if len(msg.Payload) != 4 {
+		return 0, fmt.Errorf("have payload length must be 4, got %d", len(msg.Payload))
+	}
+	return int(binary.BigEndian.Uint32(msg.Payload)), nil
+}
+
+func ParseRequest(msg *Message) (BlockRequest, error) {
+	if msg == nil || msg.ID != MsgRequest {
+		return BlockRequest{}, errors.New("expected request message")
+	}
+	return parseBlockRequestPayload(msg.Payload)
+}
+
+func ParseCancel(msg *Message) (BlockRequest, error) {
+	if msg == nil || msg.ID != MsgCancel {
+		return BlockRequest{}, errors.New("expected cancel message")
+	}
+	return parseBlockRequestPayload(msg.Payload)
+}
+
+func ParsePiece(msg *Message) (PieceBlock, error) {
+	if msg == nil || msg.ID != MsgPiece {
+		return PieceBlock{}, errors.New("expected piece message")
+	}
+	if len(msg.Payload) < 8 {
+		return PieceBlock{}, fmt.Errorf("piece payload length must be at least 8, got %d", len(msg.Payload))
+	}
+	return PieceBlock{
+		Index: int(binary.BigEndian.Uint32(msg.Payload[0:4])),
+		Begin: int(binary.BigEndian.Uint32(msg.Payload[4:8])),
+		Block: msg.Payload[8:],
+	}, nil
+}
+
+func ParseBitfield(msg *Message, pieceCount int) (*Bitfield, error) {
+	if msg == nil || msg.ID != MsgBitfield {
+		return nil, errors.New("expected bitfield message")
+	}
+	if pieceCount < 0 {
+		return nil, errors.New("piece count cannot be negative")
+	}
+	neededBytes := (pieceCount + 7) / 8
+	if len(msg.Payload) < neededBytes {
+		return nil, fmt.Errorf("bitfield too short: got %d need %d", len(msg.Payload), neededBytes)
+	}
+	return &Bitfield{bytes: append([]byte(nil), msg.Payload...), pieceCount: pieceCount}, nil
+}
+
+func parseBlockRequestPayload(payload []byte) (BlockRequest, error) {
+	if len(payload) != 12 {
+		return BlockRequest{}, fmt.Errorf("request payload length must be 12, got %d", len(payload))
+	}
+	request := BlockRequest{
+		Index:  int(binary.BigEndian.Uint32(payload[0:4])),
+		Begin:  int(binary.BigEndian.Uint32(payload[4:8])),
+		Length: int(binary.BigEndian.Uint32(payload[8:12])),
+	}
+	if request.Length <= 0 {
+		return BlockRequest{}, errors.New("request length must be positive")
+	}
+	return request, nil
+}
+
+// Bitfield stores which pieces a peer claims to have.
+type Bitfield struct {
+	bytes      []byte
+	pieceCount int
+}
+
+func (b *Bitfield) HasPiece(index int) bool {
+	if b == nil || index < 0 || index >= b.pieceCount {
+		return false
+	}
+	byteIndex := index / 8
+	bitOffset := uint(index % 8)
+	return b.bytes[byteIndex]&(1<<(7-bitOffset)) != 0
+}
+
+func (b *Bitfield) Len() int {
+	if b == nil {
+		return 0
+	}
+	return b.pieceCount
 }

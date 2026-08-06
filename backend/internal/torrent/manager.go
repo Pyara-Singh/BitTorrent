@@ -1,10 +1,10 @@
 package torrent
 
-
 import (
 	"sync"
 	"torrent-backend/internal/models"
 )
+
 // If both modify the map simultaneously, Go may crash
 type TorrentManager struct {
 	torrents map[string]models.Torrent
@@ -36,6 +36,7 @@ func (tm *TorrentManager) GetTorrent(id string) (models.Torrent, bool) {
 	torrent, exists := tm.torrents[id]
 	return torrent, exists
 }
+
 // Get all torrents
 func (tm *TorrentManager) GetAllTorrents() []models.Torrent {
 

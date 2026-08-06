@@ -1,130 +1,119 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"torrent-backend/internal/models"
 	"torrent-backend/internal/torrent"
-	"github.com/go-chi/chi/v5"
 )
+
+type torrentIDKey struct{}
 
 type Handler struct {
 	TorrentManager *torrent.TorrentManager
 }
 
 func NewHandler(tm *torrent.TorrentManager) *Handler {
-	return &Handler{
-		TorrentManager: tm,
-	}
+	return &Handler{TorrentManager: tm}
 }
 
 func (h *Handler) GetAllTorrents(w http.ResponseWriter, r *http.Request) {
-
-	torrents := h.TorrentManager.GetAllTorrents()
-
-	w.Header().Set("Content-Type", "application/json")
-
-	json.NewEncoder(w).Encode(torrents)
+	writeJSON(w, http.StatusOK, h.TorrentManager.GetAllTorrents())
 }
 
-// this is getting all the Req from the user
-
-// Handles POST /torrent/add
 func (h *Handler) AddTorrent(w http.ResponseWriter, r *http.Request) {
-
-	// Create a Torrent object
 	var newTorrent models.Torrent
+	if err := json.NewDecoder(r.Body).Decode(&newTorrent); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if err := validateTorrent(newTorrent); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	// Read JSON from the request body into newTorrent
-	err := json.NewDecoder(r.Body).Decode(&newTorrent)
+	if _, exists := h.TorrentManager.GetTorrent(newTorrent.ID); exists {
+		http.Error(w, "torrent already exists", http.StatusConflict)
+		return
+	}
 
-	if err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-	// if id == null -> empty ID
-	if newTorrent.ID == "" {
-		http.Error(w, "Torrent ID is required", http.StatusBadRequest)
-		return
-	}
-	// duplicate torrent
-	_, exists := h.TorrentManager.GetTorrent(newTorrent.ID)
-
-	if exists {
-		http.Error(w, "Torrent already exists", http.StatusConflict)
-		return
-	}
-	// if name == null
-	if newTorrent.Name == "" {
-		http.Error(w, "Torrent name is required", http.StatusBadRequest)
-		return
-	}
-	// invalid magnet link
-	if len(newTorrent.MagnetLink) < 8 || newTorrent.MagnetLink[:8] != "magnet:" {
-		http.Error(w, "Invalid magnet link", http.StatusBadRequest)
-		return
-	}
-	// memory size of the torrent
-	if newTorrent.Size <= 0 {
-		http.Error(w, "Invalid torrent size", http.StatusBadRequest)
-		return
-	}
-	// Add the torrent
 	h.TorrentManager.AddTorrent(newTorrent)
-
-	// Send success response
-	w.WriteHeader(http.StatusCreated)
-	w.Write([]byte("Torrent added successfully"))
+	writeJSON(w, http.StatusCreated, newTorrent)
 }
+
 func (h *Handler) GetTorrent(w http.ResponseWriter, r *http.Request) {
-
-	id := chi.URLParam(r, "id")
+	id := torrentID(r)
 	torrent, exists := h.TorrentManager.GetTorrent(id)
-
 	if !exists {
-		http.Error(w, "Torrent not found", http.StatusNotFound)
+		http.Error(w, "torrent not found", http.StatusNotFound)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(torrent)
+	writeJSON(w, http.StatusOK, torrent)
 }
-func (h *Handler) UpdateTorrent(w http.ResponseWriter, r *http.Request) {
 
-	id := chi.URLParam(r, "id")
+func (h *Handler) UpdateTorrent(w http.ResponseWriter, r *http.Request) {
+	id := torrentID(r)
+	if _, exists := h.TorrentManager.GetTorrent(id); !exists {
+		http.Error(w, "torrent not found", http.StatusNotFound)
+		return
+	}
 
 	var updatedTorrent models.Torrent
-
-	err := json.NewDecoder(r.Body).Decode(&updatedTorrent)
-	if err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&updatedTorrent); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
-
-	_, exists := h.TorrentManager.GetTorrent(id)
-	if !exists {
-		http.Error(w, "Torrent not found", http.StatusNotFound)
-		return
-	}
-
 	updatedTorrent.ID = id
+	if err := validateTorrent(updatedTorrent); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	h.TorrentManager.AddTorrent(updatedTorrent)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(updatedTorrent)
+	writeJSON(w, http.StatusOK, updatedTorrent)
 }
+
 func (h *Handler) DeleteTorrent(w http.ResponseWriter, r *http.Request) {
-
-	id := chi.URLParam(r, "id")
-
-	_, exists := h.TorrentManager.GetTorrent(id)
-	if !exists {
-		http.Error(w, "Torrent not found", http.StatusNotFound)
+	id := torrentID(r)
+	if _, exists := h.TorrentManager.GetTorrent(id); !exists {
+		http.Error(w, "torrent not found", http.StatusNotFound)
 		return
 	}
 
 	h.TorrentManager.RemoveTorrent(id)
+	w.WriteHeader(http.StatusNoContent)
+}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Torrent deleted successfully"))
+func validateTorrent(t models.Torrent) error {
+	if t.ID == "" {
+		return errors.New("torrent ID is required")
+	}
+	if t.Name == "" {
+		return errors.New("torrent name is required")
+	}
+	if !strings.HasPrefix(t.MagnetLink, "magnet:") {
+		return errors.New("invalid magnet link")
+	}
+	if t.Size <= 0 {
+		return errors.New("invalid torrent size")
+	}
+	return nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func withTorrentID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, torrentIDKey{}, id)
+}
+
+func torrentID(r *http.Request) string {
+	id, _ := r.Context().Value(torrentIDKey{}).(string)
+	return id
 }

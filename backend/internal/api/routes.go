@@ -2,27 +2,66 @@ package api
 
 import (
 	"net/http"
-
-	"github.com/go-chi/chi/v5"
+	"strings"
 )
 
-func RegisterRoutes(r chi.Router, handler *Handler) {
-
-	// Home
-	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello, World!"))
+// RegisterRoutes wires the HTTP API without external router dependencies.
+func RegisterRoutes(mux *http.ServeMux, handler *Handler) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("BitTorrent Backend"))
 	})
 
-	// Health Check
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("OK"))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
 	})
 
-	// Torrent APIs
-	r.Get("/torrent/all", handler.GetAllTorrents)
+	mux.HandleFunc("/torrent/all", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w)
+			return
+		}
+		handler.GetAllTorrents(w, r)
+	})
 
-	r.Post("/torrent/add", handler.AddTorrent)
-	r.Get("/torrent/{id}", handler.GetTorrent)
-	r.Put("/torrent/{id}", handler.UpdateTorrent)
-	r.Delete("/torrent/{id}", handler.DeleteTorrent)
+	mux.HandleFunc("/torrent/add", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		handler.AddTorrent(w, r)
+	})
+
+	mux.HandleFunc("/torrent/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/torrent/")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+
+		r = r.WithContext(withTorrentID(r.Context(), id))
+		switch r.Method {
+		case http.MethodGet:
+			handler.GetTorrent(w, r)
+		case http.MethodPut:
+			handler.UpdateTorrent(w, r)
+		case http.MethodDelete:
+			handler.DeleteTorrent(w, r)
+		default:
+			methodNotAllowed(w)
+		}
+	})
+}
+
+func methodNotAllowed(w http.ResponseWriter) {
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 }
